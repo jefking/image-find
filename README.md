@@ -1,4 +1,4 @@
-# image-find
+# Image Find for Samsung The Frame
 
 `imagefind` is a fast command line tool to scan a photo tree for JPEGs that are:
 
