@@ -7,6 +7,10 @@ use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
 use std::thread;
 
+const TARGET_LONG_EDGE: u32 = 3840;
+
+static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 #[derive(Debug, Clone, Copy)]
 struct ImageMeta {
     width: u16,
@@ -173,8 +177,104 @@ fn process_one(
         return Ok(ProcessOutcome::MatchedNotCopied);
     }
 
-    fs::copy(src_path, &dst_path)?;
+    copy_or_resize_matched_jpeg(src_path, &dst_path, meta, overwrite)?;
     Ok(ProcessOutcome::MatchedCopied)
+}
+
+fn copy_or_resize_matched_jpeg(
+    src_path: &Path,
+    dst_path: &Path,
+    meta: ImageMeta,
+    overwrite: bool,
+) -> io::Result<()> {
+    let w = meta.width as u32;
+    let h = meta.height as u32;
+    let long_edge = w.max(h);
+
+    // Only re-encode when needed.
+    if long_edge <= TARGET_LONG_EDGE {
+        fs::copy(src_path, dst_path)?;
+        return Ok(());
+    }
+
+    let (new_w, new_h) = resized_dims_long_edge(w, h, TARGET_LONG_EDGE);
+    resize_and_encode_jpeg(src_path, dst_path, new_w, new_h, overwrite)
+}
+
+fn resized_dims_long_edge(width: u32, height: u32, target_long_edge: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (target_long_edge.max(1), target_long_edge.max(1));
+    }
+    if width >= height {
+        let new_w = target_long_edge.max(1);
+        let new_h = (((height as f64) * (new_w as f64) / (width as f64)).round() as i64)
+            .clamp(1, i64::from(u32::MAX)) as u32;
+        (new_w, new_h)
+    } else {
+        let new_h = target_long_edge.max(1);
+        let new_w = (((width as f64) * (new_h as f64) / (height as f64)).round() as i64)
+            .clamp(1, i64::from(u32::MAX)) as u32;
+        (new_w, new_h)
+    }
+}
+
+fn resize_and_encode_jpeg(
+    src_path: &Path,
+    dst_path: &Path,
+    new_w: u32,
+    new_h: u32,
+    overwrite: bool,
+) -> io::Result<()> {
+    // Decode source (read-only). We intentionally do not preserve metadata.
+    let img = image::open(src_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Failed to decode JPEG {}: {e}", src_path.display()),
+        )
+    })?;
+
+    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+    let rgb = resized.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    let raw = rgb.into_raw();
+
+    let w16 = u16::try_from(w).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Resized width exceeds u16")
+    })?;
+    let h16 = u16::try_from(h).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Resized height exceeds u16")
+    })?;
+
+    let tmp_path = tmp_path_for(dst_path);
+    let mut enc = jpeg_encoder::Encoder::new_file(&tmp_path, 100).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("Failed to create output: {e}"))
+    })?;
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1); // 4:4:4 (no subsampling)
+    enc.encode(&raw, w16, h16, jpeg_encoder::ColorType::Rgb)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("JPEG encode failed: {e}")))?;
+
+    // Move into place. On Unix, rename overwrites; on Windows it may fail, so handle overwrite.
+    match fs::rename(&tmp_path, dst_path) {
+        Ok(()) => Ok(()),
+        Err(e) if overwrite && dst_path.exists() => {
+            let _ = fs::remove_file(dst_path);
+            fs::rename(&tmp_path, dst_path).or(Err(e))
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+fn tmp_path_for(dst_path: &Path) -> PathBuf {
+    let parent = dst_path.parent().unwrap_or_else(|| Path::new("."));
+    let fname = dst_path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output.jpg".to_string());
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{fname}.tmp{n}"))
 }
 
 fn dst_path_flat(src_path: &Path, src_root: &Path, dst_root: &Path) -> Option<PathBuf> {
@@ -680,5 +780,23 @@ mod tests {
         let src_path = PathBuf::from("/X/2024/IMG_0001.jpg");
         let out = dst_path_flat(&src_path, &src_root, &dst_root).unwrap();
         assert_eq!(out, PathBuf::from("/Y/2024IMG_0001.jpg"));
+    }
+
+    #[test]
+    fn resized_dims_long_edge_landscape() {
+        let (w, h) = resized_dims_long_edge(6000, 4000, TARGET_LONG_EDGE);
+        assert_eq!((w, h), (3840, 2560));
+    }
+
+    #[test]
+    fn resized_dims_long_edge_portrait() {
+        let (w, h) = resized_dims_long_edge(3000, 6000, TARGET_LONG_EDGE);
+        assert_eq!((w, h), (1920, 3840));
+    }
+
+    #[test]
+    fn resized_dims_long_edge_rounding() {
+        let (w, h) = resized_dims_long_edge(5000, 3333, TARGET_LONG_EDGE);
+        assert_eq!((w, h), (3840, 2560));
     }
 }

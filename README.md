@@ -48,6 +48,13 @@ then matched files will be copied to (no subdirectories):
   2) if EXIF rating is not present, embedded **XMP** (`xmp:Rating`) in JPEG APP1 segments
 - It reads JPEG dimensions from the **SOF** header (no full image decode).
 
+### Resize behavior (Samsung The Frame)
+
+- Output images are limited to **3840px on the long edge** (no crop).
+- If `max(width,height) <= 3840`, the file is **copied as-is** (no re-encode).
+- If `max(width,height) > 3840`, it is **resized** and re-encoded as JPEG with **quality=100** and **4:4:4 (no chroma subsampling)**.
+- Metadata is **not preserved** in resized outputs.
+
 ## Build
 
 This project is implemented in Rust.
