@@ -15,18 +15,10 @@ struct ImageMeta {
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let src = match args.next() {
-        Some(v) => PathBuf::from(v),
-        None => return usage_and_exit(),
+    let (overwrite, src, dst) = match parse_args() {
+        Ok(v) => v,
+        Err(_) => return usage_and_exit(),
     };
-    let dst = match args.next() {
-        Some(v) => PathBuf::from(v),
-        None => return usage_and_exit(),
-    };
-    if args.next().is_some() {
-        return usage_and_exit();
-    }
 
     let src = match fs::canonicalize(&src) {
         Ok(p) => p,
@@ -43,6 +35,11 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    if let Err(e) = fs::create_dir_all(&dst) {
+        eprintln!("Failed to create destination directory: {e}");
+        std::process::exit(2);
+    }
 
     let jobs = thread::available_parallelism()
         .map(|n| n.get())
@@ -63,6 +60,7 @@ fn main() {
 
         let src_root = src.clone();
         let dst_root = dst.clone();
+        let overwrite = overwrite;
         let scanned = Arc::clone(&scanned);
         let matched = Arc::clone(&matched);
         let copied = Arc::clone(&copied);
@@ -71,7 +69,7 @@ fn main() {
         handles.push(thread::spawn(move || {
             while let Ok(path) = rx.recv() {
                 scanned.fetch_add(1, Ordering::Relaxed);
-                match process_one(&path, &src_root, &dst_root) {
+                match process_one(&path, &src_root, &dst_root, overwrite) {
                     Ok(ProcessOutcome::Skipped) => {}
                     Ok(ProcessOutcome::MatchedNotCopied) => {
                         matched.fetch_add(1, Ordering::Relaxed);
@@ -108,6 +106,23 @@ fn main() {
     );
 }
 
+fn parse_args() -> Result<(bool, PathBuf, PathBuf), ()> {
+    let mut overwrite = false;
+    let mut positional: Vec<String> = Vec::new();
+
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-o" | "--overwrite" => overwrite = true,
+            "-h" | "--help" => return Err(()),
+            _ => positional.push(arg),
+        }
+    }
+    if positional.len() != 2 {
+        return Err(());
+    }
+    Ok((overwrite, PathBuf::from(&positional[0]), PathBuf::from(&positional[1])))
+}
+
 fn absolutize(p: &Path) -> io::Result<PathBuf> {
     if p.is_absolute() {
         Ok(p.to_path_buf())
@@ -117,8 +132,11 @@ fn absolutize(p: &Path) -> io::Result<PathBuf> {
 }
 
 fn usage_and_exit() {
-    eprintln!("Usage: imagefind <src_root> <dst_root>");
-    eprintln!("Copies files where rating==5 and width>height to dst, preserving relative paths.");
+    eprintln!("Usage: imagefind [-o] <src_root> <dst_root>");
+    eprintln!("  -o, --overwrite   overwrite destination files (default: skip existing)");
+    eprintln!(
+        "Copies JPEGs where rating==5 and width>height to dst using flat filenames: <YYYY><original_filename>"
+    );
     std::process::exit(2);
 }
 
@@ -129,7 +147,12 @@ enum ProcessOutcome {
     MatchedCopied,
 }
 
-fn process_one(src_path: &Path, src_root: &Path, dst_root: &Path) -> io::Result<ProcessOutcome> {
+fn process_one(
+    src_path: &Path,
+    src_root: &Path,
+    dst_root: &Path,
+    overwrite: bool,
+) -> io::Result<ProcessOutcome> {
     let meta = match read_jpeg_meta(src_path)? {
         Some(m) => m,
         None => return Ok(ProcessOutcome::Skipped),
@@ -141,22 +164,31 @@ fn process_one(src_path: &Path, src_root: &Path, dst_root: &Path) -> io::Result<
         return Ok(ProcessOutcome::Skipped);
     }
 
-    let rel = match src_path.strip_prefix(src_root) {
-        Ok(r) => r,
-        Err(_) => return Ok(ProcessOutcome::Skipped),
+    let dst_path = match dst_path_flat(src_path, src_root, dst_root) {
+        Some(p) => p,
+        None => return Ok(ProcessOutcome::Skipped),
     };
-    let dst_path = dst_root.join(rel);
 
-    if dst_path.exists() {
-        // Safe default: do not overwrite.
+    if dst_path.exists() && !overwrite {
         return Ok(ProcessOutcome::MatchedNotCopied);
     }
 
-    if let Some(parent) = dst_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     fs::copy(src_path, &dst_path)?;
     Ok(ProcessOutcome::MatchedCopied)
+}
+
+fn dst_path_flat(src_path: &Path, src_root: &Path, dst_root: &Path) -> Option<PathBuf> {
+    let rel = src_path.strip_prefix(src_root).ok()?;
+    let year = rel.components().next().and_then(|c| match c {
+        std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
+        _ => None,
+    });
+    let fname = src_path.file_name()?.to_string_lossy();
+    let out_name = match year {
+        Some(y) if !y.is_empty() => format!("{y}{fname}"),
+        _ => fname.to_string(),
+    };
+    Some(dst_root.join(out_name))
 }
 
 fn walk_and_dispatch(
@@ -223,7 +255,9 @@ fn parse_jpeg_meta<R: Read>(r: &mut R) -> io::Result<Option<ImageMeta>> {
 
     let mut width: Option<u16> = None;
     let mut height: Option<u16> = None;
-    let mut rating: Option<i32> = None;
+    // Prefer EXIF rating over XMP, regardless of segment order.
+    let mut rating_exif: Option<i32> = None;
+    let mut rating_xmp: Option<i32> = None;
 
     loop {
         let marker = match read_marker(r) {
@@ -268,22 +302,28 @@ fn parse_jpeg_meta<R: Read>(r: &mut R) -> io::Result<Option<ImageMeta>> {
             }
             let mut data = vec![0u8; remaining];
             r.read_exact(&mut data)?;
-            if rating.is_none() {
-                // Prefer EXIF rating (common for many workflows). If absent, fall back to XMP.
+            // Prefer EXIF rating (common for many workflows). If absent, fall back to XMP.
+            if rating_exif.is_none() {
                 if let Some(x) = parse_app1_exif_rating(&data) {
-                    rating = Some(x);
-                } else if let Some(x) = parse_app1_xmp_rating(&data) {
-                    rating = Some(x);
+                    rating_exif = Some(x);
+                }
+            }
+            if rating_xmp.is_none() {
+                if let Some(x) = parse_app1_xmp_rating(&data) {
+                    rating_xmp = Some(x);
                 }
             }
         } else {
             discard(r, remaining)?;
         }
 
-        if width.is_some() && height.is_some() && rating.is_some() {
+        // If we already have dimensions and an EXIF rating, we can stop early.
+        if width.is_some() && height.is_some() && rating_exif.is_some() {
             break;
         }
     }
+
+    let rating = rating_exif.or(rating_xmp);
 
     match (width, height) {
         (Some(w), Some(h)) => Ok(Some(ImageMeta {
@@ -557,6 +597,25 @@ mod tests {
         v
     }
 
+    fn minimal_exif_app1_with_rating(rating: u16) -> Vec<u8> {
+        // Minimal TIFF with IFD0 containing tag 0x4746 (Rating) type SHORT count 1 value=<rating>.
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes()); // ifd0 offset
+        tiff.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        tiff.extend_from_slice(&0x4746u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes()); // SHORT
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&rating.to_le_bytes());
+        tiff.extend_from_slice(&0u16.to_le_bytes()); // padding to 4 bytes
+        tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD
+
+        let mut app1 = b"Exif\0\0".to_vec();
+        app1.extend_from_slice(&tiff);
+        app1
+    }
+
     #[test]
     fn parses_dims_and_xmp_rating() {
         let jpg = minimal_jpeg_with_sof_and_xmp(4000, 3000, 5);
@@ -564,6 +623,36 @@ mod tests {
         let meta = parse_jpeg_meta(&mut r).unwrap().unwrap();
         assert_eq!(meta.width, 4000);
         assert_eq!(meta.height, 3000);
+        assert_eq!(meta.rating, Some(5));
+    }
+
+    #[test]
+    fn prefers_exif_rating_even_if_xmp_comes_first() {
+        // SOI
+        let mut jpg = vec![0xFF, 0xD8];
+
+        // APP1 XMP rating 1
+        let xmp_jpg = minimal_jpeg_with_sof_and_xmp(4000, 3000, 1);
+        // xmp_jpg already contains SOI/EOI; extract only the first APP1 segment from it.
+        // It starts at offset 2 (after SOI) and ends before SOF0 marker.
+        let sof_pos = xmp_jpg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .unwrap();
+        jpg.extend_from_slice(&xmp_jpg[2..sof_pos]);
+
+        // APP1 EXIF rating 5
+        let exif = minimal_exif_app1_with_rating(5);
+        let len = (exif.len() + 2) as u16;
+        jpg.extend_from_slice(&[0xFF, 0xE1]);
+        jpg.extend_from_slice(&len.to_be_bytes());
+        jpg.extend_from_slice(&exif);
+
+        // SOF0 + EOI from xmp_jpg
+        jpg.extend_from_slice(&xmp_jpg[sof_pos..]);
+
+        let mut r = io::Cursor::new(jpg);
+        let meta = parse_jpeg_meta(&mut r).unwrap().unwrap();
         assert_eq!(meta.rating, Some(5));
     }
 
@@ -582,5 +671,14 @@ mod tests {
         tiff.extend_from_slice(&0u16.to_le_bytes()); // padding to 4 bytes
         tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD
         assert_eq!(parse_tiff_rating(&tiff), Some(5));
+    }
+
+    #[test]
+    fn flattens_dest_path_with_year_prefix() {
+        let src_root = PathBuf::from("/X");
+        let dst_root = PathBuf::from("/Y");
+        let src_path = PathBuf::from("/X/2024/IMG_0001.jpg");
+        let out = dst_path_flat(&src_path, &src_root, &dst_root).unwrap();
+        assert_eq!(out, PathBuf::from("/Y/2024IMG_0001.jpg"));
     }
 }
