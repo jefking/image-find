@@ -16,7 +16,7 @@ imagefind <src_root> <dst_root>
 Example:
 
 ```text
-imagefind ./X ./Y
+imagefind /home/jef/Pictures/photos/ /home/jef/Pictures/theframe
 ```
 
 If your images are stored as:
