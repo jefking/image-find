@@ -42,7 +42,10 @@ then matched files will be copied to (no subdirectories):
 
 ### Notes
 
-- By default the tool **does not overwrite** existing destination files (it will count them as matched but not copied). Use `-o` to overwrite.
+- The tool runs in **two phases**:
+  1) scan + read JPEG metadata + match the filter (prints a read progress line)
+  2) copy/resize the matched set (prints a progress bar with percent and `X/Y`)
+- By default the tool **does not overwrite** existing destination files (it will skip them during the write phase). Use `-o` to overwrite.
 - Because the destination is **flat**, if you have multiple images with the same filename under the same `YYYY` (e.g. `./X/2024/a/IMG_0001.jpg` and `./X/2024/b/IMG_0001.jpg`), they will map to the same destination name (`2024-IMG_0001.jpg`). In that case the later one will be **skipped** (or **overwritten** with `-o`).
 - It reads rating in this order:
   1) embedded **EXIF/TIFF** tag `0x4746` (Rating) or `0x4749` (RatingPercent)

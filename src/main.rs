@@ -1,11 +1,8 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::Arc;
-use std::thread;
 
 const TARGET_LONG_EDGE: u32 = 3840;
 
@@ -16,6 +13,13 @@ struct ImageMeta {
     width: u16,
     height: u16,
     rating: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct Job {
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    meta: ImageMeta,
 }
 
 fn main() {
@@ -45,69 +49,94 @@ fn main() {
         std::process::exit(2);
     }
 
-    let jobs = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    // Two-phase processing:
+    // 1) Read/match: scan JPEGs, read metadata, build an explicit list of jobs.
+    // 2) Write: copy/resize those jobs.
 
-    let scanned = Arc::new(AtomicUsize::new(0));
-    let matched = Arc::new(AtomicUsize::new(0));
-    let copied = Arc::new(AtomicUsize::new(0));
-    let errors = Arc::new(AtomicUsize::new(0));
-
-    // One channel per worker to avoid receiver contention.
-    let mut senders: Vec<SyncSender<PathBuf>> = Vec::with_capacity(jobs);
-    let mut handles = Vec::with_capacity(jobs);
-
-    for _ in 0..jobs {
-        let (tx, rx) = mpsc::sync_channel::<PathBuf>(2048);
-        senders.push(tx);
-
-        let src_root = src.clone();
-        let dst_root = dst.clone();
-        let overwrite = overwrite;
-        let scanned = Arc::clone(&scanned);
-        let matched = Arc::clone(&matched);
-        let copied = Arc::clone(&copied);
-        let errors = Arc::clone(&errors);
-
-        handles.push(thread::spawn(move || {
-            while let Ok(path) = rx.recv() {
-                scanned.fetch_add(1, Ordering::Relaxed);
-                match process_one(&path, &src_root, &dst_root, overwrite) {
-                    Ok(ProcessOutcome::Skipped) => {}
-                    Ok(ProcessOutcome::MatchedNotCopied) => {
-                        matched.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(ProcessOutcome::MatchedCopied) => {
-                        matched.fetch_add(1, Ordering::Relaxed);
-                        copied.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        errors.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }));
-    }
-
-    // Producer: walk filesystem and dispatch paths round-robin.
     let skip_dir = if dst.starts_with(&src) { Some(dst.clone()) } else { None };
-    if let Err(e) = walk_and_dispatch(&src, skip_dir.as_deref(), &senders) {
-        eprintln!("Walk error: {e}");
-        std::process::exit(2);
+    let all_files = match collect_jpeg_files(&src, skip_dir.as_deref()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Walk error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let total = all_files.len();
+    eprintln!("Phase 1/2: reading metadata for {total} JPEG(s)...");
+
+    let mut errors = 0usize;
+    let mut matched_filter = 0usize;
+    let mut skipped_existing = 0usize;
+    let mut jobs: Vec<Job> = Vec::new();
+
+    for (idx, path) in all_files.iter().enumerate() {
+        print_progress_line("READ", idx + 1, total.max(1), Some(path));
+
+        let meta = match read_jpeg_meta(path) {
+            Ok(Some(m)) => m,
+            Ok(None) => continue,
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
+        };
+
+        // Do not copy or process square images.
+        if meta.width == meta.height {
+            continue;
+        }
+
+        let rating_ok = meta.rating == Some(5);
+        let landscape = meta.width > meta.height;
+        if !(rating_ok && landscape) {
+            continue;
+        }
+        matched_filter += 1;
+
+        let dst_path = match dst_path_flat(path, &src, &dst) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if dst_path.exists() && !overwrite {
+            skipped_existing += 1;
+            continue;
+        }
+
+        jobs.push(Job {
+            src_path: path.clone(),
+            dst_path,
+            meta,
+        });
     }
-    drop(senders); // close channels
-    for h in handles {
-        let _ = h.join();
-    }
+    finish_progress_line();
 
     eprintln!(
-        "scanned={} matched={} copied={} errors={}",
-        scanned.load(Ordering::Relaxed),
-        matched.load(Ordering::Relaxed),
-        copied.load(Ordering::Relaxed),
-        errors.load(Ordering::Relaxed)
+        "Phase 1/2 complete: scanned={} matched_filter={} will_process={} skipped_existing={} errors={}",
+        total,
+        matched_filter,
+        jobs.len(),
+        skipped_existing,
+        errors
     );
+
+    eprintln!("Phase 2/2: copy/resize {} image(s)...", jobs.len());
+    let total_jobs = jobs.len().max(1);
+    let mut processed_ok = 0usize;
+    let mut write_errors = 0usize;
+
+    for (idx, job) in jobs.iter().enumerate() {
+        print_progress_line("WRITE", idx + 1, total_jobs, Some(&job.src_path));
+        if copy_or_resize_matched_jpeg(&job.src_path, &job.dst_path, job.meta, overwrite).is_ok() {
+            processed_ok += 1;
+        } else {
+            write_errors += 1;
+        }
+    }
+    finish_progress_line();
+
+    eprintln!("Done: processed={} errors={}", processed_ok, errors + write_errors);
 }
 
 fn parse_args() -> Result<(bool, PathBuf, PathBuf), ()> {
@@ -144,46 +173,45 @@ fn usage_and_exit() {
     std::process::exit(2);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessOutcome {
-    Skipped,
-    MatchedNotCopied,
-    MatchedCopied,
+fn render_bar(current: usize, total: usize, width: usize) -> (usize, String) {
+    let total = total.max(1);
+    let current = current.min(total);
+    let pct = (current * 100) / total;
+    let filled = (current * width) / total;
+    let mut s = String::with_capacity(width);
+    for i in 0..width {
+        s.push(if i < filled { '#' } else { '-' });
+    }
+    (pct, s)
 }
 
-fn process_one(
-    src_path: &Path,
-    src_root: &Path,
-    dst_root: &Path,
-    overwrite: bool,
-) -> io::Result<ProcessOutcome> {
-    let meta = match read_jpeg_meta(src_path)? {
-        Some(m) => m,
-        None => return Ok(ProcessOutcome::Skipped),
+fn format_path_tail(p: &Path, max_len: usize) -> String {
+    let s = p.display().to_string();
+    if s.len() <= max_len {
+        return s;
+    }
+    let keep = max_len.saturating_sub(3);
+    let tail = &s[s.len().saturating_sub(keep)..];
+    format!("...{tail}")
+}
+
+fn print_progress_line(phase: &str, current: usize, total: usize, path: Option<&Path>) {
+    let (pct, bar) = render_bar(current, total, 30);
+    let path_s = path.map(|p| format_path_tail(p, 80)).unwrap_or_default();
+    let msg = if path_s.is_empty() {
+        format!("[{bar}] {pct:3}% {phase} {current}/{total}")
+    } else {
+        format!("[{bar}] {pct:3}% {phase} {current}/{total}  {path_s}")
     };
+    let mut out = io::stdout();
+    let _ = write!(out, "\r{msg: <140}");
+    let _ = out.flush();
+}
 
-    // Do not copy or process square images.
-    if meta.width == meta.height {
-        return Ok(ProcessOutcome::Skipped);
-    }
-
-    let rating_ok = meta.rating == Some(5);
-    let landscape = meta.width > meta.height;
-    if !(rating_ok && landscape) {
-        return Ok(ProcessOutcome::Skipped);
-    }
-
-    let dst_path = match dst_path_flat(src_path, src_root, dst_root) {
-        Some(p) => p,
-        None => return Ok(ProcessOutcome::Skipped),
-    };
-
-    if dst_path.exists() && !overwrite {
-        return Ok(ProcessOutcome::MatchedNotCopied);
-    }
-
-    copy_or_resize_matched_jpeg(src_path, &dst_path, meta, overwrite)?;
-    Ok(ProcessOutcome::MatchedCopied)
+fn finish_progress_line() {
+    let mut out = io::stdout();
+    let _ = writeln!(out);
+    let _ = out.flush();
 }
 
 fn copy_or_resize_matched_jpeg(
@@ -296,13 +324,9 @@ fn dst_path_flat(src_path: &Path, src_root: &Path, dst_root: &Path) -> Option<Pa
     Some(dst_root.join(out_name))
 }
 
-fn walk_and_dispatch(
-    src_root: &Path,
-    skip_dir: Option<&Path>,
-    senders: &[SyncSender<PathBuf>],
-) -> io::Result<()> {
+fn collect_jpeg_files(src_root: &Path, skip_dir: Option<&Path>) -> io::Result<Vec<PathBuf>> {
     let mut dirs: Vec<PathBuf> = vec![src_root.to_path_buf()];
-    let mut i = 0usize;
+    let mut out: Vec<PathBuf> = Vec::new();
 
     while let Some(dir) = dirs.pop() {
         // Avoid infinite recursion if dst is inside src.
@@ -329,13 +353,11 @@ fn walk_and_dispatch(
             if ft.is_dir() {
                 dirs.push(path);
             } else if ft.is_file() && is_jpeg_path(&path) {
-                let tx = &senders[i % senders.len()];
-                i = i.wrapping_add(1);
-                let _ = tx.send(path);
+                out.push(path);
             }
         }
     }
-    Ok(())
+    Ok(out)
 }
 
 fn is_jpeg_path(path: &Path) -> bool {
