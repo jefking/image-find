@@ -19,7 +19,7 @@ imagefind [-o|--overwrite] <src_root> <dst_root>
 Example:
 
 ```text
-imagefind /home/jef/Pictures/photos/ /home/jef/Pictures/theframe
+./target/release/imagefind /home/jef/Pictures/photos/ /home/jef/Pictures/theframe
 ```
 
 Overwrite existing destination files:
@@ -55,7 +55,8 @@ then matched files will be copied to (no subdirectories):
 ### Resize behavior (Samsung The Frame)
 
 - Output images are limited to **3840px on the long edge** (no crop).
-- If `max(width,height) <= 3840`, the file is **copied as-is** (no re-encode).
+- If `max(width,height) < 3840`, the file is **skipped** (not transferred).
+- If `max(width,height) == 3840`, the file is **copied as-is** (no re-encode).
 - If `max(width,height) > 3840`, it is **resized** and re-encoded as JPEG with **quality=100** and **4:4:4 (no chroma subsampling)**.
 - Metadata is **not preserved** in resized outputs.
 

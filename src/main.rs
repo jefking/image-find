@@ -1,8 +1,13 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 const TARGET_LONG_EDGE: u32 = 3840;
 
@@ -62,81 +67,236 @@ fn main() {
         }
     };
 
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+
     let total = all_files.len();
-    eprintln!("Phase 1/2: reading metadata for {total} JPEG(s)...");
-
-    let mut errors = 0usize;
-    let mut matched_filter = 0usize;
-    let mut skipped_existing = 0usize;
-    let mut jobs: Vec<Job> = Vec::new();
-
-    for (idx, path) in all_files.iter().enumerate() {
-        print_progress_line("READ", idx + 1, total.max(1), Some(path));
-
-        let meta = match read_jpeg_meta(path) {
-            Ok(Some(m)) => m,
-            Ok(None) => continue,
-            Err(_) => {
-                errors += 1;
-                continue;
-            }
-        };
-
-        // Do not copy or process square images.
-        if meta.width == meta.height {
-            continue;
-        }
-
-        let rating_ok = meta.rating == Some(5);
-        let landscape = meta.width > meta.height;
-        if !(rating_ok && landscape) {
-            continue;
-        }
-        matched_filter += 1;
-
-        let dst_path = match dst_path_flat(path, &src, &dst) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        if dst_path.exists() && !overwrite {
-            skipped_existing += 1;
-            continue;
-        }
-
-        jobs.push(Job {
-            src_path: path.clone(),
-            dst_path,
-            meta,
-        });
+    if total == 0 {
+        eprintln!("No JPEG(s) found under source directory.");
+        return;
     }
-    finish_progress_line();
+    eprintln!(
+        "Phase 1/2: reading metadata for {total} JPEG(s) using {workers} thread(s)..."
+    );
+
+    // ---- Phase 1 (parallel): read metadata and build job list ----
+    // NOTE: counters represent COMPLETED files/jobs, not merely dispatched.
+    let read_scanned = Arc::new(AtomicUsize::new(0));
+    let read_errors = Arc::new(AtomicUsize::new(0));
+    let matched_filter = Arc::new(AtomicUsize::new(0));
+    let skipped_existing = Arc::new(AtomicUsize::new(0));
+    let skipped_too_small = Arc::new(AtomicUsize::new(0));
+    let jobs_out: Arc<Mutex<Vec<Job>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let ui_stop = Arc::new(AtomicUsize::new(0));
+    let ui_scanned = Arc::clone(&read_scanned);
+    let ui_stop2 = Arc::clone(&ui_stop);
+    let ui_total = total.max(1);
+    let ui_handle = thread::spawn(move || {
+        while ui_stop2.load(Ordering::Relaxed) == 0 {
+            let done = ui_scanned.load(Ordering::Relaxed).min(ui_total);
+            print_progress_line("READ", done, ui_total, None);
+            if done >= ui_total {
+                break;
+            }
+            thread::sleep(Duration::from_millis(120));
+        }
+        print_progress_line(
+            "READ",
+            ui_scanned.load(Ordering::Relaxed).min(ui_total),
+            ui_total,
+            None,
+        );
+        finish_progress_line();
+    });
+
+    // One channel per worker (keeps receiver contention low).
+    let mut senders: Vec<SyncSender<PathBuf>> = Vec::with_capacity(workers);
+    let mut handles = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        let (tx, rx) = mpsc::sync_channel::<PathBuf>(2048);
+        senders.push(tx);
+
+        let src_root = src.clone();
+        let dst_root = dst.clone();
+        let overwrite = overwrite;
+        let read_scanned = Arc::clone(&read_scanned);
+        let read_errors = Arc::clone(&read_errors);
+        let matched_filter = Arc::clone(&matched_filter);
+        let skipped_existing = Arc::clone(&skipped_existing);
+        let skipped_too_small = Arc::clone(&skipped_too_small);
+        let jobs_out = Arc::clone(&jobs_out);
+
+        handles.push(thread::spawn(move || {
+            while let Ok(path) = rx.recv() {
+			let mut job_to_push: Option<Job> = None;
+
+			match read_jpeg_meta(&path) {
+				Ok(Some(meta)) => {
+					// Do not copy or process square images.
+					if meta.width != meta.height {
+						let rating_ok = meta.rating == Some(5);
+						let landscape = meta.width > meta.height;
+						if rating_ok && landscape {
+							// Enforce minimum resolution: do not transfer images whose long edge is < TARGET_LONG_EDGE.
+							let long_edge = u32::from(meta.width).max(u32::from(meta.height));
+							if long_edge < TARGET_LONG_EDGE {
+								skipped_too_small.fetch_add(1, Ordering::Relaxed);
+								read_scanned.fetch_add(1, Ordering::Relaxed);
+								continue;
+							}
+
+							matched_filter.fetch_add(1, Ordering::Relaxed);
+							if let Some(dst_path) = dst_path_flat(&path, &src_root, &dst_root) {
+								if dst_path.exists() && !overwrite {
+									skipped_existing.fetch_add(1, Ordering::Relaxed);
+								} else {
+									job_to_push = Some(Job {
+										src_path: path,
+										dst_path,
+										meta,
+									});
+								}
+							}
+						}
+					}
+				}
+				Ok(None) => {}
+				Err(_) => {
+					read_errors.fetch_add(1, Ordering::Relaxed);
+				}
+			}
+
+			if let Some(job) = job_to_push {
+				jobs_out.lock().unwrap().push(job);
+			}
+			read_scanned.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    for (i, p) in all_files.into_iter().enumerate() {
+        let _ = senders[i % senders.len()].send(p);
+    }
+    drop(senders);
+    for h in handles {
+        let _ = h.join();
+    }
+    ui_stop.store(1, Ordering::Relaxed);
+    let _ = ui_handle.join();
+
+    let errors = read_errors.load(Ordering::Relaxed);
+    let matched_filter_n = matched_filter.load(Ordering::Relaxed);
+    let skipped_existing_n = skipped_existing.load(Ordering::Relaxed);
+    let skipped_too_small_n = skipped_too_small.load(Ordering::Relaxed);
+
+    // Drain jobs and de-duplicate destination paths to avoid concurrent writes to the same file.
+    let mut jobs = {
+        let mut guard = jobs_out.lock().unwrap();
+        std::mem::take(&mut *guard)
+    };
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut deduped: Vec<Job> = Vec::with_capacity(jobs.len());
+    let mut dup_dsts = 0usize;
+    for job in jobs.drain(..) {
+        if seen.insert(job.dst_path.clone()) {
+            deduped.push(job);
+        } else {
+            dup_dsts += 1;
+        }
+    }
+    let jobs = deduped;
 
     eprintln!(
-        "Phase 1/2 complete: scanned={} matched_filter={} will_process={} skipped_existing={} errors={}",
+	        "Phase 1/2 complete: scanned={} matched_filter={} will_process={} skipped_existing={} skipped_too_small={} dup_destinations={} errors={}",
         total,
-        matched_filter,
+        matched_filter_n,
         jobs.len(),
-        skipped_existing,
+        skipped_existing_n,
+	        skipped_too_small_n,
+        dup_dsts,
         errors
     );
 
-    eprintln!("Phase 2/2: copy/resize {} image(s)...", jobs.len());
-    let total_jobs = jobs.len().max(1);
-    let mut processed_ok = 0usize;
-    let mut write_errors = 0usize;
-
-    for (idx, job) in jobs.iter().enumerate() {
-        print_progress_line("WRITE", idx + 1, total_jobs, Some(&job.src_path));
-        if copy_or_resize_matched_jpeg(&job.src_path, &job.dst_path, job.meta, overwrite).is_ok() {
-            processed_ok += 1;
-        } else {
-            write_errors += 1;
-        }
+    // ---- Phase 2 (parallel): copy/resize jobs ----
+    if jobs.is_empty() {
+        eprintln!("Phase 2/2: nothing to do (0 jobs). Done.");
+        return;
     }
-    finish_progress_line();
 
-    eprintln!("Done: processed={} errors={}", processed_ok, errors + write_errors);
+    eprintln!("Phase 2/2: copy/resize {} image(s) using {workers} thread(s)...", jobs.len());
+    let jobs = Arc::new(jobs);
+    let total_jobs = jobs.len();
+    let next_job = Arc::new(AtomicUsize::new(0));
+    let write_done = Arc::new(AtomicUsize::new(0));
+    let write_ok = Arc::new(AtomicUsize::new(0));
+    let write_errors = Arc::new(AtomicUsize::new(0));
+
+    let ui_stop = Arc::new(AtomicUsize::new(0));
+    let ui_done = Arc::clone(&write_done);
+    let ui_stop2 = Arc::clone(&ui_stop);
+    let ui_handle = thread::spawn(move || {
+        while ui_stop2.load(Ordering::Relaxed) == 0 {
+            let done = ui_done.load(Ordering::Relaxed).min(total_jobs);
+            print_progress_line("WRITE", done, total_jobs, None);
+            if done >= total_jobs {
+                break;
+            }
+            thread::sleep(Duration::from_millis(120));
+        }
+        print_progress_line(
+            "WRITE",
+            ui_done.load(Ordering::Relaxed).min(total_jobs),
+            total_jobs,
+            None,
+        );
+        finish_progress_line();
+    });
+
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let overwrite = overwrite;
+        let jobs = Arc::clone(&jobs);
+        let next_job = Arc::clone(&next_job);
+        let write_done = Arc::clone(&write_done);
+        let write_ok = Arc::clone(&write_ok);
+        let write_errors = Arc::clone(&write_errors);
+
+        handles.push(thread::spawn(move || loop {
+            let idx = next_job.fetch_add(1, Ordering::Relaxed);
+            if idx >= jobs.len() {
+                break;
+            }
+            let job = &jobs[idx];
+            match copy_or_resize_matched_jpeg(
+                &job.src_path,
+                &job.dst_path,
+                job.meta,
+                overwrite,
+            ) {
+                Ok(_) => {
+                    write_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => {
+                    write_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            write_done.fetch_add(1, Ordering::Relaxed);
+        }));
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+    ui_stop.store(1, Ordering::Relaxed);
+    let _ = ui_handle.join();
+
+    let processed_ok = write_ok.load(Ordering::Relaxed);
+    let write_errors_n = write_errors.load(Ordering::Relaxed);
+    eprintln!("Done: processed_ok={} errors={}", processed_ok, errors + write_errors_n);
 }
 
 fn parse_args() -> Result<(bool, PathBuf, PathBuf), ()> {
@@ -223,6 +383,11 @@ fn copy_or_resize_matched_jpeg(
     let w = meta.width as u32;
     let h = meta.height as u32;
     let long_edge = w.max(h);
+
+    // Minimum resolution requirement: do not transfer images whose long edge is below the target.
+    if long_edge < TARGET_LONG_EDGE {
+        return Ok(());
+    }
 
     // Only re-encode when needed.
     if long_edge <= TARGET_LONG_EDGE {
