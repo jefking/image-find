@@ -139,7 +139,7 @@ fn usage_and_exit() {
     eprintln!("Usage: imagefind [-o] <src_root> <dst_root>");
     eprintln!("  -o, --overwrite   overwrite destination files (default: skip existing)");
     eprintln!(
-        "Copies JPEGs where rating==5 and width>height to dst using flat filenames: <YYYY><original_filename>"
+        "Copies JPEGs where rating==5 and width>height to dst using flat filenames: <YYYY>-<original_filename>"
     );
     std::process::exit(2);
 }
@@ -161,6 +161,11 @@ fn process_one(
         Some(m) => m,
         None => return Ok(ProcessOutcome::Skipped),
     };
+
+    // Do not copy or process square images.
+    if meta.width == meta.height {
+        return Ok(ProcessOutcome::Skipped);
+    }
 
     let rating_ok = meta.rating == Some(5);
     let landscape = meta.width > meta.height;
@@ -285,7 +290,7 @@ fn dst_path_flat(src_path: &Path, src_root: &Path, dst_root: &Path) -> Option<Pa
     });
     let fname = src_path.file_name()?.to_string_lossy();
     let out_name = match year {
-        Some(y) if !y.is_empty() => format!("{y}{fname}"),
+        Some(y) if !y.is_empty() => format!("{y}-{fname}"),
         _ => fname.to_string(),
     };
     Some(dst_root.join(out_name))
@@ -779,7 +784,7 @@ mod tests {
         let dst_root = PathBuf::from("/Y");
         let src_path = PathBuf::from("/X/2024/IMG_0001.jpg");
         let out = dst_path_flat(&src_path, &src_root, &dst_root).unwrap();
-        assert_eq!(out, PathBuf::from("/Y/2024IMG_0001.jpg"));
+        assert_eq!(out, PathBuf::from("/Y/2024-IMG_0001.jpg"));
     }
 
     #[test]

@@ -4,10 +4,11 @@
 
 - **5-star rated** (`rating == 5`)
 - **landscape** (`width > height`)
+- **not square** (`width != height`)
 
 …and copy those files to a destination directory as a **flat** set of files named:
 
-`<YYYY><original_filename>.jpg`
+`<YYYY>-<original_filename>.jpg`
 
 ## Usage
 
@@ -36,13 +37,13 @@ If your images are stored as:
 then matched files will be copied to (no subdirectories):
 
 ```text
-./Y/YYYY<original_filename>.jpg
+./Y/YYYY-<original_filename>.jpg
 ```
 
 ### Notes
 
 - By default the tool **does not overwrite** existing destination files (it will count them as matched but not copied). Use `-o` to overwrite.
-- Because the destination is **flat**, if you have multiple images with the same filename under the same `YYYY` (e.g. `./X/2024/a/IMG_0001.jpg` and `./X/2024/b/IMG_0001.jpg`), they will map to the same destination name (`2024IMG_0001.jpg`). In that case the later one will be **skipped** (or **overwritten** with `-o`).
+- Because the destination is **flat**, if you have multiple images with the same filename under the same `YYYY` (e.g. `./X/2024/a/IMG_0001.jpg` and `./X/2024/b/IMG_0001.jpg`), they will map to the same destination name (`2024-IMG_0001.jpg`). In that case the later one will be **skipped** (or **overwritten** with `-o`).
 - It reads rating in this order:
   1) embedded **EXIF/TIFF** tag `0x4746` (Rating) or `0x4749` (RatingPercent)
   2) if EXIF rating is not present, embedded **XMP** (`xmp:Rating`) in JPEG APP1 segments
