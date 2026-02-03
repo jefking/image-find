@@ -77,5 +77,5 @@ target/release/imagefind
 Run:
 
 ```text
-target/release/imagefind ./X ./Y
+target/release/imagefind /home/jef/Pictures/photos /home/jef/Pictures/digital-display
 ```
