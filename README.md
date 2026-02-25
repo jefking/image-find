@@ -19,7 +19,8 @@ imagefind [-o|--overwrite] <src_root> <dst_root>
 Example:
 
 ```text
-./target/release/imagefind /home/jef/Pictures/photos/ /home/jef/Pictures/theframe
+./target/release/imagefind /media/jef/1.44.1-72806/photos/processed /home/jef/Pictures/display
+./target/release/imagefind /home/jef/Pictures/photos/inprogress/ /home/jef/Pictures/display
 ```
 
 Overwrite existing destination files:
