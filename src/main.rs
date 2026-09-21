@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 const TARGET_LONG_EDGE: u32 = 3840;
+const DEFAULT_SOURCE: &str = "/home/jef/Pictures/photos";
+const DEFAULT_DESTINATION: &str = "/home/jef/Pictures/best-of";
+const EXCLUDED_DIRS: &[&str] = &["Dianne King", "older", "adult"];
 
 static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -22,6 +25,7 @@ struct ImageMeta {
 
 #[derive(Debug, Clone)]
 struct Job {
+    scan_order: usize,
     src_path: PathBuf,
     dst_path: PathBuf,
     meta: ImageMeta,
@@ -58,7 +62,11 @@ fn main() {
     // 1) Read/match: scan JPEGs, read metadata, build an explicit list of jobs.
     // 2) Write: copy/resize those jobs.
 
-    let skip_dir = if dst.starts_with(&src) { Some(dst.clone()) } else { None };
+    let skip_dir = if dst.starts_with(&src) {
+        Some(dst.clone())
+    } else {
+        None
+    };
     let all_files = match collect_jpeg_files(&src, skip_dir.as_deref()) {
         Ok(v) => v,
         Err(e) => {
@@ -77,9 +85,7 @@ fn main() {
         eprintln!("No JPEG(s) found under source directory.");
         return;
     }
-    eprintln!(
-        "Phase 1/2: reading metadata for {total} JPEG(s) using {workers} thread(s)..."
-    );
+    eprintln!("Phase 1/2: reading metadata for {total} JPEG(s) using {workers} thread(s)...");
 
     // ---- Phase 1 (parallel): read metadata and build job list ----
     // NOTE: counters represent COMPLETED files/jobs, not merely dispatched.
@@ -113,16 +119,15 @@ fn main() {
     });
 
     // One channel per worker (keeps receiver contention low).
-    let mut senders: Vec<SyncSender<PathBuf>> = Vec::with_capacity(workers);
+    let mut senders: Vec<SyncSender<(usize, PathBuf)>> = Vec::with_capacity(workers);
     let mut handles = Vec::with_capacity(workers);
 
     for _ in 0..workers {
-        let (tx, rx) = mpsc::sync_channel::<PathBuf>(2048);
+        let (tx, rx) = mpsc::sync_channel::<(usize, PathBuf)>(2048);
         senders.push(tx);
 
         let src_root = src.clone();
         let dst_root = dst.clone();
-        let overwrite = overwrite;
         let read_scanned = Arc::clone(&read_scanned);
         let read_errors = Arc::clone(&read_errors);
         let matched_filter = Arc::clone(&matched_filter);
@@ -131,55 +136,56 @@ fn main() {
         let jobs_out = Arc::clone(&jobs_out);
 
         handles.push(thread::spawn(move || {
-            while let Ok(path) = rx.recv() {
-			let mut job_to_push: Option<Job> = None;
+            while let Ok((scan_order, path)) = rx.recv() {
+                let mut job_to_push: Option<Job> = None;
 
-			match read_jpeg_meta(&path) {
-				Ok(Some(meta)) => {
-					// Do not copy or process square images.
-					if meta.width != meta.height {
-						let rating_ok = meta.rating == Some(5);
-						let landscape = meta.width > meta.height;
-						if rating_ok && landscape {
-							// Enforce minimum resolution: do not transfer images whose long edge is < TARGET_LONG_EDGE.
-							let long_edge = u32::from(meta.width).max(u32::from(meta.height));
-							if long_edge < TARGET_LONG_EDGE {
-								skipped_too_small.fetch_add(1, Ordering::Relaxed);
-								read_scanned.fetch_add(1, Ordering::Relaxed);
-								continue;
-							}
+                match read_jpeg_meta(&path) {
+                    Ok(Some(meta)) => {
+                        // Do not copy or process square images.
+                        if meta.width != meta.height {
+                            let rating_ok = matches!(meta.rating, Some(4 | 5));
+                            let landscape = meta.width > meta.height;
+                            if rating_ok && landscape {
+                                // Enforce minimum resolution: do not transfer images whose long edge is < TARGET_LONG_EDGE.
+                                let long_edge = u32::from(meta.width).max(u32::from(meta.height));
+                                if long_edge < TARGET_LONG_EDGE {
+                                    skipped_too_small.fetch_add(1, Ordering::Relaxed);
+                                    read_scanned.fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
 
-							matched_filter.fetch_add(1, Ordering::Relaxed);
-							if let Some(dst_path) = dst_path_flat(&path, &src_root, &dst_root) {
-								if dst_path.exists() && !overwrite {
-									skipped_existing.fetch_add(1, Ordering::Relaxed);
-								} else {
-									job_to_push = Some(Job {
-										src_path: path,
-										dst_path,
-										meta,
-									});
-								}
-							}
-						}
-					}
-				}
-				Ok(None) => {}
-				Err(_) => {
-					read_errors.fetch_add(1, Ordering::Relaxed);
-				}
-			}
+                                matched_filter.fetch_add(1, Ordering::Relaxed);
+                                if let Some(dst_path) = dst_path_flat(&path, &src_root, &dst_root) {
+                                    if dst_path.exists() && !overwrite {
+                                        skipped_existing.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        job_to_push = Some(Job {
+                                            scan_order,
+                                            src_path: path,
+                                            dst_path,
+                                            meta,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        read_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
 
-			if let Some(job) = job_to_push {
-				jobs_out.lock().unwrap().push(job);
-			}
-			read_scanned.fetch_add(1, Ordering::Relaxed);
+                if let Some(job) = job_to_push {
+                    jobs_out.lock().unwrap().push(job);
+                }
+                read_scanned.fetch_add(1, Ordering::Relaxed);
             }
         }));
     }
 
     for (i, p) in all_files.into_iter().enumerate() {
-        let _ = senders[i % senders.len()].send(p);
+        let _ = senders[i % senders.len()].send((i, p));
     }
     drop(senders);
     for h in handles {
@@ -194,21 +200,11 @@ fn main() {
     let skipped_too_small_n = skipped_too_small.load(Ordering::Relaxed);
 
     // Drain jobs and de-duplicate destination paths to avoid concurrent writes to the same file.
-    let mut jobs = {
+    let jobs = {
         let mut guard = jobs_out.lock().unwrap();
         std::mem::take(&mut *guard)
     };
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut deduped: Vec<Job> = Vec::with_capacity(jobs.len());
-    let mut dup_dsts = 0usize;
-    for job in jobs.drain(..) {
-        if seen.insert(job.dst_path.clone()) {
-            deduped.push(job);
-        } else {
-            dup_dsts += 1;
-        }
-    }
-    let jobs = deduped;
+    let (jobs, dup_dsts) = deduplicate_jobs(jobs);
 
     eprintln!(
 	        "Phase 1/2 complete: scanned={} matched_filter={} will_process={} skipped_existing={} skipped_too_small={} dup_destinations={} errors={}",
@@ -227,13 +223,17 @@ fn main() {
         return;
     }
 
-    eprintln!("Phase 2/2: copy/resize {} image(s) using {workers} thread(s)...", jobs.len());
+    eprintln!(
+        "Phase 2/2: copy/resize {} image(s) using {workers} thread(s)...",
+        jobs.len()
+    );
     let jobs = Arc::new(jobs);
     let total_jobs = jobs.len();
     let next_job = Arc::new(AtomicUsize::new(0));
     let write_done = Arc::new(AtomicUsize::new(0));
     let write_ok = Arc::new(AtomicUsize::new(0));
     let write_errors = Arc::new(AtomicUsize::new(0));
+    let skipped_at_write = Arc::new(AtomicUsize::new(0));
 
     let ui_stop = Arc::new(AtomicUsize::new(0));
     let ui_done = Arc::clone(&write_done);
@@ -258,12 +258,12 @@ fn main() {
 
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let overwrite = overwrite;
         let jobs = Arc::clone(&jobs);
         let next_job = Arc::clone(&next_job);
         let write_done = Arc::clone(&write_done);
         let write_ok = Arc::clone(&write_ok);
         let write_errors = Arc::clone(&write_errors);
+        let skipped_at_write = Arc::clone(&skipped_at_write);
 
         handles.push(thread::spawn(move || loop {
             let idx = next_job.fetch_add(1, Ordering::Relaxed);
@@ -271,14 +271,12 @@ fn main() {
                 break;
             }
             let job = &jobs[idx];
-            match copy_or_resize_matched_jpeg(
-                &job.src_path,
-                &job.dst_path,
-                job.meta,
-                overwrite,
-            ) {
-                Ok(_) => {
+            match copy_or_resize_matched_jpeg(&job.src_path, &job.dst_path, job.meta, overwrite) {
+                Ok(true) => {
                     write_ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(false) => {
+                    skipped_at_write.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(_) => {
                     write_errors.fetch_add(1, Ordering::Relaxed);
@@ -296,24 +294,36 @@ fn main() {
 
     let processed_ok = write_ok.load(Ordering::Relaxed);
     let write_errors_n = write_errors.load(Ordering::Relaxed);
-    eprintln!("Done: processed_ok={} errors={}", processed_ok, errors + write_errors_n);
+    eprintln!(
+        "Done: processed_ok={} skipped_at_write={} errors={}",
+        processed_ok,
+        skipped_at_write.load(Ordering::Relaxed),
+        errors + write_errors_n
+    );
 }
 
 fn parse_args() -> Result<(bool, PathBuf, PathBuf), ()> {
-    let mut overwrite = false;
-    let mut positional: Vec<String> = Vec::new();
+    parse_args_from(std::env::args_os().skip(1))
+}
 
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "-o" | "--overwrite" => overwrite = true,
-            "-h" | "--help" => return Err(()),
+fn parse_args_from(
+    args: impl IntoIterator<Item = OsString>,
+) -> Result<(bool, PathBuf, PathBuf), ()> {
+    let mut overwrite = false;
+    let mut positional = Vec::new();
+
+    for arg in args {
+        match arg.to_str() {
+            Some("-o" | "--overwrite") => overwrite = true,
+            Some(s) if s.starts_with('-') => return Err(()),
             _ => positional.push(arg),
         }
     }
-    if positional.len() != 2 {
-        return Err(());
+    match positional.as_slice() {
+        [] => Ok((overwrite, DEFAULT_SOURCE.into(), DEFAULT_DESTINATION.into())),
+        [src, dst] => Ok((overwrite, src.into(), dst.into())),
+        _ => Err(()),
     }
-    Ok((overwrite, PathBuf::from(&positional[0]), PathBuf::from(&positional[1])))
 }
 
 fn absolutize(p: &Path) -> io::Result<PathBuf> {
@@ -325,12 +335,27 @@ fn absolutize(p: &Path) -> io::Result<PathBuf> {
 }
 
 fn usage_and_exit() {
-    eprintln!("Usage: imagefind [-o] <src_root> <dst_root>");
+    eprintln!("Usage: imagefind [-o|--overwrite] [<src_root> <dst_root>]");
     eprintln!("  -o, --overwrite   overwrite destination files (default: skip existing)");
+    eprintln!("  Default source: {DEFAULT_SOURCE}");
+    eprintln!("  Default destination: {DEFAULT_DESTINATION}");
+    eprintln!("  Excluded folders: Dianne King, older, adult (at any depth)");
+    eprintln!("  Searches paths in reverse order (newest year first).");
     eprintln!(
-        "Copies JPEGs where rating==5 and width>height to dst using flat filenames: <YYYY>-<original_filename>"
+        "Copies landscape JPEGs rated 4 or 5 stars, with a long edge of at least {TARGET_LONG_EDGE}px, to a flat destination."
     );
     std::process::exit(2);
+}
+
+fn deduplicate_jobs(mut jobs: Vec<Job>) -> (Vec<Job>, usize) {
+    // Metadata workers finish out of order; restore newest-first priority before
+    // selecting a single source for each destination, even with --overwrite.
+    jobs.sort_unstable_by_key(|job| job.scan_order);
+    let original_len = jobs.len();
+    let mut seen = HashSet::new();
+    jobs.retain(|job| seen.insert(job.dst_path.clone()));
+    let duplicates = original_len - jobs.len();
+    (jobs, duplicates)
 }
 
 fn render_bar(current: usize, total: usize, width: usize) -> (usize, String) {
@@ -379,20 +404,26 @@ fn copy_or_resize_matched_jpeg(
     dst_path: &Path,
     meta: ImageMeta,
     overwrite: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let w = meta.width as u32;
     let h = meta.height as u32;
     let long_edge = w.max(h);
 
     // Minimum resolution requirement: do not transfer images whose long edge is below the target.
     if long_edge < TARGET_LONG_EDGE {
-        return Ok(());
+        return Ok(false);
+    }
+
+    if !overwrite && dst_path.try_exists()? {
+        return Ok(false);
     }
 
     // Only re-encode when needed.
     if long_edge <= TARGET_LONG_EDGE {
-        fs::copy(src_path, dst_path)?;
-        return Ok(());
+        return write_output(dst_path, overwrite, |output| {
+            io::copy(&mut fs::File::open(src_path)?, output)?;
+            Ok(())
+        });
     }
 
     let (new_w, new_h) = resized_dims_long_edge(w, h, TARGET_LONG_EDGE);
@@ -422,7 +453,7 @@ fn resize_and_encode_jpeg(
     new_w: u32,
     new_h: u32,
     overwrite: bool,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     // Decode source (read-only). We intentionally do not preserve metadata.
     let img = image::open(src_path).map_err(|e| {
         io::Error::new(
@@ -436,33 +467,57 @@ fn resize_and_encode_jpeg(
     let (w, h) = rgb.dimensions();
     let raw = rgb.into_raw();
 
-    let w16 = u16::try_from(w).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "Resized width exceeds u16")
-    })?;
-    let h16 = u16::try_from(h).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "Resized height exceeds u16")
-    })?;
+    let w16 = u16::try_from(w)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Resized width exceeds u16"))?;
+    let h16 = u16::try_from(h)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Resized height exceeds u16"))?;
 
-    let tmp_path = tmp_path_for(dst_path);
-    let mut enc = jpeg_encoder::Encoder::new_file(&tmp_path, 100).map_err(|e| {
-        io::Error::new(io::ErrorKind::Other, format!("Failed to create output: {e}"))
-    })?;
-    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1); // 4:4:4 (no subsampling)
-    enc.encode(&raw, w16, h16, jpeg_encoder::ColorType::Rgb)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("JPEG encode failed: {e}")))?;
+    write_output(dst_path, overwrite, |output| {
+        let mut buffered = io::BufWriter::new(output);
+        let mut enc = jpeg_encoder::Encoder::new(&mut buffered, 100);
+        enc.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1); // 4:4:4 (no subsampling)
+        enc.encode(&raw, w16, h16, jpeg_encoder::ColorType::Rgb)
+            .map_err(|e| io::Error::other(format!("JPEG encode failed: {e}")))?;
+        buffered.flush()
+    })
+}
 
-    // Move into place. On Unix, rename overwrites; on Windows it may fail, so handle overwrite.
-    match fs::rename(&tmp_path, dst_path) {
-        Ok(()) => Ok(()),
-        Err(e) if overwrite && dst_path.exists() => {
-            let _ = fs::remove_file(dst_path);
-            fs::rename(&tmp_path, dst_path).or(Err(e))
+fn write_output(
+    dst_path: &Path,
+    overwrite: bool,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<bool> {
+    // Stage both copies and resized JPEGs next to the destination. create_new
+    // also prevents separate runs from sharing or truncating a temporary file.
+    let (tmp_path, mut output) = loop {
+        let path = tmp_path_for(dst_path);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => break (path, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
         }
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e)
+    };
+    let written = write(&mut output).and_then(|_| output.flush());
+    drop(output);
+    let result = written.and_then(|_| {
+        if overwrite {
+            fs::rename(&tmp_path, dst_path).map(|_| true)
+        } else {
+            // Unlike rename/copy, hard_link atomically refuses an existing name,
+            // including a file created after the initial existence check.
+            match fs::hard_link(&tmp_path, dst_path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                Err(e) => Err(e),
+            }
         }
-    }
+    });
+    let _ = fs::remove_file(&tmp_path);
+    result
 }
 
 fn tmp_path_for(dst_path: &Path) -> PathBuf {
@@ -472,21 +527,12 @@ fn tmp_path_for(dst_path: &Path) -> PathBuf {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "output.jpg".to_string());
     let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    parent.join(format!(".{fname}.tmp{n}"))
+    parent.join(format!(".{fname}.tmp{}-{n}", std::process::id()))
 }
 
 fn dst_path_flat(src_path: &Path, src_root: &Path, dst_root: &Path) -> Option<PathBuf> {
-    let rel = src_path.strip_prefix(src_root).ok()?;
-    let year = rel.components().next().and_then(|c| match c {
-        std::path::Component::Normal(s) => Some(s.to_string_lossy().to_string()),
-        _ => None,
-    });
-    let fname = src_path.file_name()?.to_string_lossy();
-    let out_name = match year {
-        Some(y) if !y.is_empty() => format!("{y}-{fname}"),
-        _ => fname.to_string(),
-    };
-    Some(dst_root.join(out_name))
+    src_path.strip_prefix(src_root).ok()?;
+    Some(dst_root.join(src_path.file_name()?))
 }
 
 fn collect_jpeg_files(src_root: &Path, skip_dir: Option<&Path>) -> io::Result<Vec<PathBuf>> {
@@ -516,12 +562,20 @@ fn collect_jpeg_files(src_root: &Path, skip_dir: Option<&Path>) -> io::Result<Ve
                 Err(_) => continue,
             };
             if ft.is_dir() {
-                dirs.push(path);
+                let excluded = entry.file_name().to_str().is_some_and(|name| {
+                    EXCLUDED_DIRS
+                        .iter()
+                        .any(|excluded| name.trim().eq_ignore_ascii_case(excluded))
+                });
+                if !excluded {
+                    dirs.push(path);
+                }
             } else if ft.is_file() && is_jpeg_path(&path) {
                 out.push(path);
             }
         }
     }
+    out.sort_unstable_by(|a, b| b.cmp(a));
     Ok(out)
 }
 
@@ -746,6 +800,7 @@ fn parse_tiff_rating(tiff: &[u8]) -> Option<i32> {
     let ifd0 = read_u32(tiff, 4, little)? as usize;
     let n = read_u16(tiff, ifd0, little)? as usize;
     let mut off = ifd0 + 2;
+    let mut rating_percent = None;
     for _ in 0..n {
         if off + 12 > tiff.len() {
             return None;
@@ -760,17 +815,32 @@ fn parse_tiff_rating(tiff: &[u8]) -> Option<i32> {
             let size = type_size(typ)?;
             let total = (count as usize).checked_mul(size)?;
             if count == 1 {
-                if total <= 4 {
-                    return read_inline_value(value, typ, little);
+                let rating = if total <= 4 {
+                    read_inline_value(value, typ, little)
+                } else {
+                    let data_off = read_u32(tiff, off + 8, little)? as usize;
+                    read_typed_value(tiff, data_off, typ, little)
+                };
+                if tag == 0x4746 {
+                    return rating;
                 }
-                let data_off = read_u32(tiff, off + 8, little)? as usize;
-                return read_typed_value(tiff, data_off, typ, little);
+                // Windows RatingPercent uses a 1–99 scale, not a star count.
+                // https://learn.microsoft.com/en-us/windows/win32/properties/props-system-rating
+                rating_percent = rating.and_then(|value| match value {
+                    0 => Some(0),
+                    1..=12 => Some(1),
+                    13..=37 => Some(2),
+                    38..=62 => Some(3),
+                    63..=87 => Some(4),
+                    88..=99 => Some(5),
+                    _ => None,
+                });
             }
         }
 
         off += 12;
     }
-    None
+    rating_percent
 }
 
 fn type_size(typ: u16) -> Option<usize> {
@@ -859,6 +929,81 @@ fn read_i32_from_4(v: &[u8], little: bool) -> Option<i32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn defaults_to_photos_and_best_of_without_overwriting() {
+        assert_eq!(
+            parse_args_from([]),
+            Ok((false, DEFAULT_SOURCE.into(), DEFAULT_DESTINATION.into()))
+        );
+        for flag in ["-o", "--overwrite"] {
+            assert_eq!(
+                parse_args_from([flag.into()]),
+                Ok((true, DEFAULT_SOURCE.into(), DEFAULT_DESTINATION.into()))
+            );
+        }
+        assert_eq!(
+            parse_args_from(["/source".into(), "/destination".into()]),
+            Ok((false, "/source".into(), "/destination".into()))
+        );
+        assert!(parse_args_from(["/source".into()]).is_err());
+        assert!(parse_args_from(["--unknown".into()]).is_err());
+    }
+
+    #[test]
+    fn duplicate_selection_uses_scan_order_instead_of_worker_completion_order() {
+        let meta = ImageMeta {
+            width: 3840,
+            height: 2160,
+            rating: Some(4),
+        };
+        let jobs = [
+            (2, "/photos/2008/shared.jpg"),
+            (0, "/photos/2026/shared.jpg"),
+            (1, "/photos/2025/shared.jpg"),
+        ]
+        .into_iter()
+        .map(|(scan_order, path)| Job {
+            scan_order,
+            src_path: path.into(),
+            dst_path: "/best-of/shared.jpg".into(),
+            meta,
+        })
+        .collect();
+        let (jobs, duplicates) = deduplicate_jobs(jobs);
+        assert_eq!(duplicates, 2);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].src_path, Path::new("/photos/2026/shared.jpg"));
+    }
+
+    #[test]
+    fn output_created_during_processing_is_preserved_and_temp_files_are_cleaned() {
+        let directory =
+            std::env::temp_dir().join(format!("imagefind-write-test-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let dst = directory.join("photo.jpg");
+        let copied = write_output(&dst, false, |output| {
+            output.write_all(b"older photo")?;
+            // Simulate another process creating the destination after scanning.
+            fs::write(&dst, b"existing photo")
+        })
+        .unwrap();
+        assert!(!copied);
+        assert_eq!(fs::read(&dst).unwrap(), b"existing photo");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        assert!(write_output(&dst, true, |output| output.write_all(b"replacement")).unwrap());
+        assert_eq!(fs::read(&dst).unwrap(), b"replacement");
+
+        assert!(write_output(&dst, true, |output| {
+            output.write_all(b"incomplete")?;
+            Err(io::Error::other("simulated encoder failure"))
+        })
+        .is_err());
+        assert_eq!(fs::read(&dst).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
     fn minimal_jpeg_with_sof_and_xmp(width: u16, height: u16, rating: i32) -> Vec<u8> {
         // SOI
         let mut v = vec![0xFF, 0xD8];
@@ -927,10 +1072,7 @@ mod tests {
         let xmp_jpg = minimal_jpeg_with_sof_and_xmp(4000, 3000, 1);
         // xmp_jpg already contains SOI/EOI; extract only the first APP1 segment from it.
         // It starts at offset 2 (after SOI) and ends before SOF0 marker.
-        let sof_pos = xmp_jpg
-            .windows(2)
-            .position(|w| w == [0xFF, 0xC0])
-            .unwrap();
+        let sof_pos = xmp_jpg.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
         jpg.extend_from_slice(&xmp_jpg[2..sof_pos]);
 
         // APP1 EXIF rating 5
@@ -966,12 +1108,32 @@ mod tests {
     }
 
     #[test]
-    fn flattens_dest_path_with_year_prefix() {
+    fn converts_exif_rating_percent_to_stars() {
+        for (percent, stars) in [
+            (0, 0),
+            (1, 1),
+            (25, 2),
+            (50, 3),
+            (63, 4),
+            (75, 4),
+            (87, 4),
+            (88, 5),
+            (99, 5),
+        ] {
+            let mut app1 = minimal_exif_app1_with_rating(percent);
+            // Replace Rating with RatingPercent in the TIFF IFD entry.
+            app1[16..18].copy_from_slice(&0x4749u16.to_le_bytes());
+            assert_eq!(parse_app1_exif_rating(&app1), Some(stars));
+        }
+    }
+
+    #[test]
+    fn flattens_dest_path_with_original_filename() {
         let src_root = PathBuf::from("/X");
         let dst_root = PathBuf::from("/Y");
         let src_path = PathBuf::from("/X/2024/IMG_0001.jpg");
         let out = dst_path_flat(&src_path, &src_root, &dst_root).unwrap();
-        assert_eq!(out, PathBuf::from("/Y/2024-IMG_0001.jpg"));
+        assert_eq!(out, PathBuf::from("/Y/IMG_0001.jpg"));
     }
 
     #[test]

@@ -2,43 +2,50 @@
 
 `imagefind` is a fast command line tool to scan a photo tree for JPEGs that are:
 
-- **5-star rated** (`rating == 5`)
+- **4- or 5-star rated**
 - **landscape** (`width > height`)
 - **not square** (`width != height`)
 
-…and copy those files to a destination directory as a **flat** set of files named:
+…and copy those files to a destination directory as a **flat** set of files using their original filenames.
 
-`<YYYY>-<original_filename>.jpg`
+The default source is `/home/jef/Pictures/photos` and the default destination is `/home/jef/Pictures/best-of`.
+
+Folders named **Dianne King**, **older**, or **adult** are excluded at every depth. Matching ignores case and surrounding whitespace, including the existing `Dianne King ` folder.
 
 ## Usage
 
 ```text
-imagefind [-o|--overwrite] <src_root> <dst_root>
+imagefind [-o|--overwrite] [<src_root> <dst_root>]
 ```
 
-Example:
+Run with the default directories:
 
 ```text
-./target/release/imagefind /media/jef/1.44.1-72806/photos/processed /home/jef/Pictures/display
-./target/release/imagefind /home/jef/Pictures/photos/inprogress/ /home/jef/Pictures/display
+./target/release/imagefind
 ```
 
-Overwrite existing destination files:
+Or specify both directories explicitly:
 
 ```text
-imagefind -o /home/jef/Pictures/photos/ /home/jef/Pictures/theframe
+./target/release/imagefind /home/jef/Pictures/photos /home/jef/Pictures/best-of
 ```
 
-If your images are stored as:
+Overwrite existing destination files (off by default):
 
 ```text
-./X/YYYY/*.jpg
+./target/release/imagefind --overwrite
 ```
 
-then matched files will be copied to (no subdirectories):
+For example, a matching source photo at:
 
 ```text
-./Y/YYYY-<original_filename>.jpg
+/home/jef/Pictures/photos/2026/album/IMG_0001.jpg
+```
+
+is written directly to:
+
+```text
+/home/jef/Pictures/best-of/IMG_0001.jpg
 ```
 
 ### Notes
@@ -46,10 +53,12 @@ then matched files will be copied to (no subdirectories):
 - The tool runs in **two phases**:
   1) scan + read JPEG metadata + match the filter (prints a read progress line)
   2) copy/resize the matched set (prints a progress bar with percent and `X/Y`)
-- By default the tool **does not overwrite** existing destination files (it will skip them during the write phase). Use `-o` to overwrite.
-- Because the destination is **flat**, if you have multiple images with the same filename under the same `YYYY` (e.g. `./X/2024/a/IMG_0001.jpg` and `./X/2024/b/IMG_0001.jpg`), they will map to the same destination name (`2024-IMG_0001.jpg`). In that case the later one will be **skipped** (or **overwritten** with `-o`).
+- Files are queued in **reverse path order**, so the year folders are searched **2026 → 2025 → … → 2008**. Within each year, paths also sort in reverse order. This uses folder/path names, not EXIF capture dates or modification times; the year range is not hard-coded.
+- Metadata reads and writes run in parallel. If matching photos share a filename, the first in that newest-first search order wins, regardless of when workers finish. This also applies with `--overwrite`, so an older duplicate cannot replace the selected newer source in the same run.
+- By default the tool **does not overwrite** existing destination files, including files created while the tool is running. Use `-o` or `--overwrite` to replace them. The flag replaces existing outputs without comparing their dates.
+- Output contains **no subdirectories or added year prefixes**. An existing `IMG_0001.jpg` is skipped by default regardless of which source year contains that filename.
 - It reads rating in this order:
-  1) embedded **EXIF/TIFF** tag `0x4746` (Rating) or `0x4749` (RatingPercent)
+  1) embedded **EXIF/TIFF** tag `0x4746` (Rating), falling back to `0x4749` (RatingPercent, converted to stars)
   2) if EXIF rating is not present, embedded **XMP** (`xmp:Rating`) in JPEG APP1 segments
 - It reads JPEG dimensions from the **SOF** header (no full image decode).
 
@@ -78,5 +87,11 @@ target/release/imagefind
 Run:
 
 ```text
-target/release/imagefind /home/jef/Pictures/photos /home/jef/Pictures/digital-display
+target/release/imagefind
+```
+
+Run tests:
+
+```text
+cargo test
 ```
